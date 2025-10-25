@@ -214,44 +214,29 @@ class InvitacionView(discord.ui.View):
 
 @bot.tree.command(name='crear_clan', description='Iniciar proceso de creación de un clan')
 async def crear_clan_cmd(interaction: discord.Interaction):
-    """Crear un nuevo clan con flujo interactivo en thread privado"""
+    """Crear un nuevo clan con flujo interactivo por DM"""
 
-    # Crear un canal temporal para el thread o usar un canal existente
     await interaction.response.defer(ephemeral=True)
 
     try:
         guild = interaction.guild
         autor = interaction.user
 
-        # Buscar un canal apropiado para crear el thread (idealmente un canal de comandos o el primer canal de texto)
-        canal_comandos = None
-        for channel in guild.text_channels:
-            if channel.permissions_for(guild.me).create_private_threads:
-                canal_comandos = channel
-                break
-
-        if not canal_comandos:
+        # Intentar enviar DM al usuario
+        try:
+            dm_channel = await autor.create_dm()
+        except discord.Forbidden:
             await interaction.followup.send(
-                "❌ No pude encontrar un canal donde crear el thread privado. Contacta a un administrador.",
+                "❌ No puedo enviarte mensajes directos. Por favor, habilita los DMs en la configuración de privacidad del servidor.",
                 ephemeral=True
             )
             return
 
-        # Crear thread privado
-        thread = await canal_comandos.create_thread(
-            name=f"Creación de Clan - {autor.name}",
-            type=discord.ChannelType.private_thread,
-            invitable=False
-        )
-
-        # Agregar al usuario al thread
-        await thread.add_user(autor)
-
-        # Mensaje de bienvenida en el thread
+        # Mensaje de bienvenida en DM
         embed_inicio = discord.Embed(
             title="🏰 Creación de Clan",
             description=f"¡Hola {autor.mention}! Vamos a crear tu clan paso a paso.\n\n"
-                        f"Este thread es **privado** y solo visible para ti y los administradores.",
+                        f"Esta conversación es **privada** entre tú y yo.",
             color=0x0099ff
         )
         embed_inicio.add_field(
@@ -264,18 +249,18 @@ async def crear_clan_cmd(interaction: discord.Interaction):
             inline=False
         )
 
-        await thread.send(embed=embed_inicio)
+        await dm_channel.send(embed=embed_inicio)
 
         # Confirmar al usuario
         await interaction.followup.send(
-            f"✅ Thread privado creado: {thread.mention}\n"
-            f"Continúa allí con la creación de tu clan.",
+            f"✅ Te he enviado un mensaje directo.\n"
+            f"Revisa tus DMs para continuar con la creación de tu clan.",
             ephemeral=True
         )
 
         # Iniciar el flujo interactivo
         def check_author(m):
-            return m.author == autor and m.channel == thread
+            return m.author == autor and isinstance(m.channel, discord.DMChannel)
 
         # Esperar nombre
         nombre = None
@@ -289,12 +274,12 @@ async def crear_clan_cmd(interaction: discord.Interaction):
 
                 # Validar nombre
                 if len(nombre) < 3 or len(nombre) > 32:
-                    await thread.send("❌ El nombre debe tener entre 3 y 32 caracteres. Intenta de nuevo:")
+                    await dm_channel.send("❌ El nombre debe tener entre 3 y 32 caracteres. Intenta de nuevo:")
                     intentos += 1
                     continue
 
                 if clan_existe(nombre):
-                    await thread.send(f"❌ El clan '{nombre}' ya existe. Elige otro nombre:")
+                    await dm_channel.send(f"❌ El clan '{nombre}' ya existe. Elige otro nombre:")
                     intentos += 1
                     continue
 
@@ -302,15 +287,15 @@ async def crear_clan_cmd(interaction: discord.Interaction):
                 break
 
             except asyncio.TimeoutError:
-                await thread.send("⏱️ Se acabó el tiempo. Usa `/crear_clan` nuevamente para reintentar.")
+                await dm_channel.send("⏱️ Se acabó el tiempo. Usa `/crear_clan` nuevamente para reintentar.")
                 return
 
         if intentos >= max_intentos:
-            await thread.send("❌ Demasiados intentos fallidos. Usa `/crear_clan` nuevamente.")
+            await dm_channel.send("❌ Demasiados intentos fallidos. Usa `/crear_clan` nuevamente.")
             return
 
         # Confirmar nombre
-        await thread.send(f"✅ Nombre del clan: **{nombre}**")
+        await dm_channel.send(f"✅ Nombre del clan: **{nombre}**")
 
         # Paso 2: Descripción
         embed_desc = discord.Embed(
@@ -319,7 +304,7 @@ async def crear_clan_cmd(interaction: discord.Interaction):
                         "Puedes escribir `ninguna` o `skip` si no quieres agregar descripción ahora.",
             color=0x0099ff
         )
-        await thread.send(embed=embed_desc)
+        await dm_channel.send(embed=embed_desc)
 
         try:
             msg_desc = await bot.wait_for('message', check=check_author, timeout=300.0)
@@ -327,13 +312,13 @@ async def crear_clan_cmd(interaction: discord.Interaction):
 
             if descripcion.lower() in ['ninguna', 'skip', 'no', 'none']:
                 descripcion = ""
-                await thread.send("✅ Sin descripción.")
+                await dm_channel.send("✅ Sin descripción.")
             else:
-                await thread.send(f"✅ Descripción: {descripcion}")
+                await dm_channel.send(f"✅ Descripción: {descripcion}")
 
         except asyncio.TimeoutError:
             descripcion = ""
-            await thread.send("⏱️ Sin descripción (tiempo agotado).")
+            await dm_channel.send("⏱️ Sin descripción (tiempo agotado).")
 
         # Paso 3: Confirmación
         embed_confirmacion = discord.Embed(
@@ -349,21 +334,21 @@ async def crear_clan_cmd(interaction: discord.Interaction):
             inline=False
         )
 
-        await thread.send(embed=embed_confirmacion)
+        await dm_channel.send(embed=embed_confirmacion)
 
         try:
             msg_confirm = await bot.wait_for('message', check=check_author, timeout=120.0)
 
             if msg_confirm.content.lower() not in ['confirmar', 'si', 'yes', 'confirm']:
-                await thread.send("❌ Creación cancelada.")
+                await dm_channel.send("❌ Creación cancelada.")
                 return
 
         except asyncio.TimeoutError:
-            await thread.send("⏱️ Se acabó el tiempo. Creación cancelada.")
+            await dm_channel.send("⏱️ Se acabó el tiempo. Creación cancelada.")
             return
 
         # Crear el clan
-        await thread.send("⏳ Creando clan...")
+        await dm_channel.send("⏳ Creando clan...")
 
         # Crear rol del clan
         clan_role = await guild.create_role(
@@ -462,30 +447,35 @@ async def crear_clan_cmd(interaction: discord.Interaction):
         )
         await canal_admin.send(embed=embed_admin)
 
-        # Respuesta en el thread
+        # Respuesta en DM
         embed_exito = discord.Embed(
             title="✅ ¡Clan Creado Exitosamente!",
-            description=f"Tu clan **{nombre}** ha sido creado.",
+            description=f"Tu clan **{nombre}** ha sido creado en **{guild.name}**.",
             color=0x00ff00
         )
-        embed_exito.add_field(name="📂 Categoría", value=categoria.mention, inline=False)
+        embed_exito.add_field(name="📂 Categoría", value=f"🏰 {nombre}", inline=False)
         embed_exito.add_field(name="🎭 Rol", value=clan_role.mention, inline=True)
         embed_exito.add_field(name="📊 Nivel", value="1 (0/500 XP)", inline=True)
         embed_exito.add_field(name="👥 Límite", value="10 miembros", inline=True)
         embed_exito.add_field(
             name="🔐 Invitación Secreta",
-            value=f"Disponible en {canal_anuncios.mention}",
+            value=f"Disponible en el canal 📢-anuncios de tu clan",
+            inline=False
+        )
+        embed_exito.add_field(
+            name="📍 Cómo llegar",
+            value=f"Busca la categoría **🏰 {nombre}** en {guild.name}",
             inline=False
         )
 
-        await thread.send(embed=embed_exito)
-        await thread.send("Puedes cerrar este thread cuando quieras. ¡Disfruta tu clan! 🎉")
+        await dm_channel.send(embed=embed_exito)
+        await dm_channel.send("¡Disfruta tu clan! 🎉")
 
     except Exception as e:
         logger.error(f"Error al crear clan: {e}")
         logger.exception(e)
         try:
-            await thread.send(f"❌ Error al crear el clan: {str(e)}")
+            await dm_channel.send(f"❌ Error al crear el clan: {str(e)}")
         except:
             await interaction.followup.send(
                 f"❌ Error al crear el clan: {str(e)}",
