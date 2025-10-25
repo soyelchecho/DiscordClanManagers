@@ -228,10 +228,22 @@ async def crear_clan_cmd(interaction: discord.Interaction):
         thread_channel_id = os.getenv('CLAN_MANAGEMENT_CHANNEL_ID')
 
         if not thread_channel_id:
-            # Si no está configurado, usar el canal actual
-            canal_para_thread = interaction.channel
-        else:
-            canal_para_thread = guild.get_channel(int(thread_channel_id))
+            await interaction.followup.send(
+                "❌ El canal de gestión de clanes no está configurado. Contacta a un administrador.",
+                ephemeral=True
+            )
+            return
+
+        # Validar que el comando se use SOLO en el canal configurado
+        if interaction.channel.id != int(thread_channel_id):
+            canal_correcto = guild.get_channel(int(thread_channel_id))
+            await interaction.followup.send(
+                f"❌ Este comando solo se puede usar en {canal_correcto.mention if canal_correcto else 'el canal de gestión de clanes'}.",
+                ephemeral=True
+            )
+            return
+
+        canal_para_thread = interaction.channel
 
         if not canal_para_thread:
             await interaction.followup.send(
