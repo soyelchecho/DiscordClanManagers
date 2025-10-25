@@ -12,7 +12,12 @@ from database import (
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(levelname)-8s] %(name)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -23,38 +28,37 @@ bot = commands.Bot(command_prefix='/', intents=intents)
 
 @bot.event
 async def on_ready():
-    print(f'{bot.user} ha iniciado sesión')
-    print(f'Bot conectado a {len(bot.guilds)} servidores')
+    logger.info(f'{bot.user} ha iniciado sesión')
+    logger.info(f'Bot conectado a {len(bot.guilds)} servidores')
 
     # Inicializar base de datos
     init_database()
-    print('Base de datos SQLite inicializada')
+    logger.info('Base de datos SQLite inicializada')
 
     # Migrar datos de JSON si existen
     migrate_from_json()
 
     try:
-        print('Iniciando sincronización de comandos...')
+        logger.info('Iniciando sincronización de comandos...')
         # Sincronizar comandos directamente en el servidor (más rápido)
         guild_id = os.getenv('GUILD_ID')
-        print(f'GUILD_ID obtenido: {guild_id}')
+        logger.info(f'GUILD_ID obtenido: {guild_id}')
 
         if guild_id:
             guild_id = int(guild_id)
-            print(f'Sincronizando en servidor {guild_id}...')
+            logger.info(f'Sincronizando en servidor {guild_id}...')
             guild = discord.Object(id=guild_id)
             bot.tree.copy_global_to(guild=guild)
             synced = await bot.tree.sync(guild=guild)
-            print(f'✅ Sincronizados {len(synced)} comandos en servidor {guild_id}')
-            print(f'Comandos sincronizados: {[cmd.name for cmd in synced]}')
+            logger.info(f'✅ Sincronizados {len(synced)} comandos en servidor {guild_id}')
+            logger.info(f'Comandos sincronizados: {[cmd.name for cmd in synced]}')
         else:
-            print('GUILD_ID no encontrado, sincronizando globalmente...')
+            logger.warning('GUILD_ID no encontrado, sincronizando globalmente...')
             synced = await bot.tree.sync()
-            print(f'✅ Sincronizados {len(synced)} comandos globalmente')
+            logger.info(f'✅ Sincronizados {len(synced)} comandos globalmente')
     except Exception as e:
-        print(f'❌ Error al sincronizar comandos: {e}')
-        import traceback
-        traceback.print_exc()
+        logger.error(f'❌ Error al sincronizar comandos: {e}')
+        logger.exception(e)
 
 class TicketView(discord.ui.View):
     def __init__(self):
