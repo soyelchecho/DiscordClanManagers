@@ -53,8 +53,16 @@ async def on_ready():
 
         if guild_id:
             guild_id = int(guild_id)
-            logger.info(f'Sincronizando en servidor {guild_id}...')
             guild = discord.Object(id=guild_id)
+
+            # LIMPIAR comandos viejos primero
+            logger.info(f'Limpiando comandos antiguos del servidor {guild_id}...')
+            bot.tree.clear_commands(guild=guild)
+            await bot.tree.sync(guild=guild)
+            logger.info('✅ Comandos antiguos limpiados')
+
+            # Ahora sincronizar los nuevos
+            logger.info(f'Sincronizando comandos nuevos en servidor {guild_id}...')
             bot.tree.copy_global_to(guild=guild)
             synced = await bot.tree.sync(guild=guild)
             logger.info(f'✅ Sincronizados {len(synced)} comandos en servidor {guild_id}')
