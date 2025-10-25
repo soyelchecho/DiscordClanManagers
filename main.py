@@ -225,7 +225,7 @@ async def crear_clan_cmd(interaction: discord.Interaction):
         autor = interaction.user
 
         # Obtener el canal configurado para threads desde .env
-        thread_channel_id = os.getenv('THREAD_CHANNEL_ID')
+        thread_channel_id = os.getenv('CLAN_MANAGEMENT_CHANNEL_ID')
 
         if not thread_channel_id:
             # Si no está configurado, usar el canal actual
