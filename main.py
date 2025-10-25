@@ -67,6 +67,78 @@ async def on_ready():
         logger.error(f'❌ Error al sincronizar comandos: {e}')
         logger.exception(e)
 
+@bot.event
+async def on_member_join(member):
+    """Detectar cuando alguien se une mediante invitación permanente y dar XP"""
+    try:
+        # Obtener las invitaciones actuales
+        invites_after = await member.guild.invites()
+
+        # Buscar en todos los clanes cuál invitación se usó
+        clanes = obtener_todos_clanes()
+
+        for clan_nombre, clan_info in clanes.items():
+            # Verificar si la invitación del clan fue usada
+            invite_code = clan_info.get('invite_code')
+            if not invite_code:
+                continue
+
+            # Buscar la invitación en la lista
+            for invite in invites_after:
+                if invite.code == invite_code:
+                    # Esta es una invitación permanente de un clan
+                    # Agregar el miembro al clan como Recluta por defecto
+                    clan_role = member.guild.get_role(clan_info['rol_id'])
+
+                    if clan_role:
+                        # Asignar rol de Discord
+                        await member.add_roles(clan_role)
+
+                        # Agregar a la base de datos
+                        agregar_miembro_clan(
+                            clan_nombre=clan_nombre,
+                            usuario_id=member.id,
+                            rol='Recluta',
+                            invitado_por=None  # No sabemos quién compartió el link
+                        )
+
+                        # Dar XP al clan (+50 XP por nuevo miembro)
+                        resultado = agregar_xp_clan(
+                            clan_nombre=clan_nombre,
+                            cantidad_xp=50,
+                            razon="Nuevo miembro se unió mediante invitación permanente",
+                            usuario_id=member.id,
+                            origen="invitacion_permanente"
+                        )
+
+                        # Notificar en el canal general
+                        canal_general = member.guild.get_channel(clan_info['canal_general_id'])
+                        if canal_general:
+                            embed = discord.Embed(
+                                title="🎉 ¡Nuevo Miembro!",
+                                description=f"{member.mention} se ha unido al clan mediante la invitación permanente",
+                                color=0x00ff00
+                            )
+                            embed.add_field(name="Rol asignado", value="Recluta", inline=True)
+                            embed.add_field(name="XP ganado", value="+50 XP", inline=True)
+
+                            if resultado and resultado.get('subio_nivel'):
+                                embed.add_field(
+                                    name="🎊 ¡NIVEL SUBIDO!",
+                                    value=f"Nivel {resultado['nivel_anterior']} → {resultado['nivel_nuevo']}\n"
+                                          f"Nuevos límites desbloqueados!",
+                                    inline=False
+                                )
+
+                            await canal_general.send(embed=embed)
+
+                        logger.info(f"Usuario {member.name} se unió al clan {clan_nombre} mediante invitación permanente (+50 XP)")
+                        break
+
+    except Exception as e:
+        logger.error(f"Error en on_member_join: {e}")
+        logger.exception(e)
+
 # ==================== VISTAS/UI ====================
 
 class InvitacionView(discord.ui.View):
