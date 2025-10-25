@@ -212,6 +212,56 @@ class InvitacionView(discord.ui.View):
         else:
             await interaction.response.send_message("❌ Error al rechazar la invitación.", ephemeral=True)
 
+class ConfirmacionClanView(discord.ui.View):
+    def __init__(self, autor_id: int, thread: discord.Thread):
+        super().__init__(timeout=120)  # 2 minutos de timeout
+        self.autor_id = autor_id
+        self.thread = thread
+        self.confirmado = None
+
+    @discord.ui.button(label='✅ Confirmar', style=discord.ButtonStyle.green)
+    async def confirmar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.autor_id:
+            await interaction.response.send_message("❌ Solo el creador puede confirmar.", ephemeral=True)
+            return
+
+        self.confirmado = True
+
+        # Desactivar botones
+        for item in self.children:
+            item.disabled = True
+
+        await interaction.response.edit_message(
+            content="✅ Confirmado. Creando clan...",
+            view=self
+        )
+        self.stop()
+
+    @discord.ui.button(label='❌ Cancelar', style=discord.ButtonStyle.red)
+    async def cancelar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.autor_id:
+            await interaction.response.send_message("❌ Solo el creador puede cancelar.", ephemeral=True)
+            return
+
+        self.confirmado = False
+
+        # Desactivar botones
+        for item in self.children:
+            item.disabled = True
+
+        await interaction.response.edit_message(
+            content="❌ Creación cancelada. Serás removido del thread.",
+            view=self
+        )
+
+        # Remover al usuario del thread
+        try:
+            await self.thread.remove_user(interaction.user)
+        except:
+            pass
+
+        self.stop()
+
 # ==================== COMANDOS PÚBLICOS ====================
 
 @bot.tree.command(name='crear_clan', description='Iniciar proceso de creación de un clan')
@@ -374,7 +424,7 @@ async def crear_clan_cmd(interaction: discord.Interaction):
             descripcion = ""
             await thread.send("⏱️ Sin descripción (tiempo agotado).")
 
-        # Paso 3: Confirmación
+        # Paso 3: Confirmación con botones
         embed_confirmacion = discord.Embed(
             title="🏰 Confirmación Final",
             description="Revisa los datos de tu clan:",
@@ -384,25 +434,31 @@ async def crear_clan_cmd(interaction: discord.Interaction):
         embed_confirmacion.add_field(name="Descripción", value=descripcion or "Sin descripción", inline=False)
         embed_confirmacion.add_field(
             name="¿Crear el clan?",
-            value="Escribe `confirmar` para crear el clan o `cancelar` para abortar.",
+            value="Usa los botones de abajo para confirmar o cancelar.",
             inline=False
         )
 
-        await thread.send(embed=embed_confirmacion)
+        # Crear View con botones
+        view = ConfirmacionClanView(autor.id, thread)
+        mensaje_confirmacion = await thread.send(embed=embed_confirmacion, view=view)
 
-        try:
-            msg_confirm = await bot.wait_for('message', check=check_author, timeout=120.0)
+        # Esperar a que el usuario haga clic en un botón
+        await view.wait()
 
-            if msg_confirm.content.lower() not in ['confirmar', 'si', 'yes', 'confirm']:
-                await thread.send("❌ Creación cancelada.")
-                return
-
-        except asyncio.TimeoutError:
+        # Verificar qué botón presionó
+        if view.confirmado is None:
+            # Timeout
             await thread.send("⏱️ Se acabó el tiempo. Creación cancelada.")
+            try:
+                await thread.remove_user(autor)
+            except:
+                pass
+            return
+        elif view.confirmado is False:
+            # Canceló
             return
 
-        # Crear el clan
-        await thread.send("⏳ Creando clan...")
+        # Confirmó - crear el clan
 
         # Crear rol del clan
         clan_role = await guild.create_role(
