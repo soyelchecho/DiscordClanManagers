@@ -1,13 +1,18 @@
 import discord
 from discord.ext import commands
+from discord import app_commands
 import os
 import asyncio
 import logging
 from dotenv import load_dotenv
+from datetime import datetime
 from database import (
-    init_database, migrate_from_json, crear_clan, obtener_clan,
-    obtener_todos_clanes, clan_existe, obtener_clan_por_canal_admin,
-    agregar_canal_extra, obtener_estadisticas
+    init_database, crear_clan, obtener_clan, obtener_todos_clanes,
+    clan_existe, obtener_clan_por_canal_admin, agregar_canal_extra,
+    agregar_xp_clan, agregar_miembro_clan, obtener_miembros_clan,
+    obtener_rol_miembro, es_miembro_clan, crear_invitacion,
+    obtener_invitacion, aceptar_invitacion, rechazar_invitacion,
+    contar_canales_extra, limpiar_invitaciones_expiradas, NIVELES_CLAN
 )
 
 load_dotenv()
@@ -23,8 +28,11 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 intents.members = True
+intents.dm_messages = True
 
-bot = commands.Bot(command_prefix='/', intents=intents)
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+# ==================== EVENTOS ====================
 
 @bot.event
 async def on_ready():
@@ -35,12 +43,11 @@ async def on_ready():
     init_database()
     logger.info('Base de datos SQLite inicializada')
 
-    # Migrar datos de JSON si existen
-    migrate_from_json()
+    # Limpiar invitaciones expiradas
+    limpiar_invitaciones_expiradas()
 
     try:
         logger.info('Iniciando sincronización de comandos...')
-        # Sincronizar comandos directamente en el servidor (más rápido)
         guild_id = os.getenv('GUILD_ID')
         logger.info(f'GUILD_ID obtenido: {guild_id}')
 
@@ -60,140 +67,178 @@ async def on_ready():
         logger.error(f'❌ Error al sincronizar comandos: {e}')
         logger.exception(e)
 
-class TicketView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
+# ==================== VISTAS/UI ====================
 
-    @discord.ui.button(label='🎫 Crear Ticket', style=discord.ButtonStyle.green)
-    async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        user = interaction.user
-        
-        # Crear thread privado
-        ticket_thread = await interaction.channel.create_thread(
-            name=f'ticket-{user.display_name}',
-            type=discord.ChannelType.private_thread
-        )
-        
-        await ticket_thread.add_user(user)
-        
-        embed = discord.Embed(
-            title="🎫 Sistema de Tickets",
-            description=f"¡Hola {user.mention}! Este es tu ticket privado.\n\n**Comandos disponibles:**\n`/crear_clan <nombre>` - Crear un nuevo clan\n`/info_clan <nombre>` - Ver información de un clan",
-            color=0x00ff00
-        )
-        
-        await ticket_thread.send(embed=embed)
-        
+class InvitacionView(discord.ui.View):
+    def __init__(self, invitacion_id: int):
+        super().__init__(timeout=None)
+        self.invitacion_id = invitacion_id
+
+    @discord.ui.button(label='✅ Aceptar', style=discord.ButtonStyle.green, custom_id='aceptar_invitacion')
+    async def aceptar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        invitacion = obtener_invitacion(self.invitacion_id)
+
+        if not invitacion or invitacion['usuario_invitado_id'] != interaction.user.id:
+            await interaction.response.send_message("❌ Esta invitación no es para ti.", ephemeral=True)
+            return
+
+        if invitacion['estado'] != 'pendiente':
+            await interaction.response.send_message("❌ Esta invitación ya no está disponible.", ephemeral=True)
+            return
+
+        # Aceptar invitación
+        if aceptar_invitacion(self.invitacion_id):
+            clan_info = obtener_clan(invitacion['clan_nombre'])
+
+            embed = discord.Embed(
+                title="✅ ¡Te has unido al clan!",
+                description=f"Ahora eres parte de **{invitacion['clan_nombre']}**",
+                color=0x00ff00
+            )
+            embed.add_field(name="Rol asignado", value=invitacion['rol_asignado'])
+            embed.add_field(name="Nivel del clan", value=f"Nivel {clan_info['nivel']}")
+
+            # Desactivar botones
+            for item in self.children:
+                item.disabled = True
+
+            await interaction.response.edit_message(embed=embed, view=self)
+
+            # Notificar en el canal del clan si existe
+            try:
+                guild = bot.get_guild(int(os.getenv('GUILD_ID')))
+                canal_general = guild.get_channel(clan_info['canal_general_id'])
+                if canal_general:
+                    await canal_general.send(f"🎉 {interaction.user.mention} se ha unido al clan!")
+            except:
+                pass
+        else:
+            await interaction.response.send_message("❌ Error al aceptar la invitación.", ephemeral=True)
+
+    @discord.ui.button(label='❌ Rechazar', style=discord.ButtonStyle.red, custom_id='rechazar_invitacion')
+    async def rechazar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        invitacion = obtener_invitacion(self.invitacion_id)
+
+        if not invitacion or invitacion['usuario_invitado_id'] != interaction.user.id:
+            await interaction.response.send_message("❌ Esta invitación no es para ti.", ephemeral=True)
+            return
+
+        if rechazar_invitacion(self.invitacion_id):
+            embed = discord.Embed(
+                title="❌ Invitación rechazada",
+                description=f"Has rechazado la invitación a **{invitacion['clan_nombre']}**",
+                color=0xff0000
+            )
+
+            # Desactivar botones
+            for item in self.children:
+                item.disabled = True
+
+            await interaction.response.edit_message(embed=embed, view=self)
+        else:
+            await interaction.response.send_message("❌ Error al rechazar la invitación.", ephemeral=True)
+
+# ==================== COMANDOS PÚBLICOS ====================
+
+@bot.tree.command(name='crear_clan', description='Crear un nuevo clan en el servidor')
+@app_commands.describe(nombre='Nombre del clan', descripcion='Descripción breve del clan')
+async def crear_clan_cmd(interaction: discord.Interaction, nombre: str, descripcion: str = ""):
+    """Crear un nuevo clan con flujo interactivo"""
+
+    # Validaciones
+    if len(nombre) < 3 or len(nombre) > 32:
         await interaction.response.send_message(
-            f"✅ Ticket creado: {ticket_thread.mention}",
+            "❌ El nombre del clan debe tener entre 3 y 32 caracteres.",
             ephemeral=True
         )
-
-@bot.tree.command(name='setup_tickets', description='Configurar el sistema de tickets para clanes')
-@discord.app_commands.describe()
-async def setup_tickets(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Solo administradores pueden usar este comando.", ephemeral=True)
         return
-    
-    embed = discord.Embed(
-        title="🏰 Sistema de Gestión de Clanes",
-        description="Haz clic en el botón para abrir un ticket y gestionar tu clan.",
-        color=0x0099ff
-    )
-    
-    view = TicketView()
-    await interaction.response.send_message(embed=embed, view=view)
 
-@bot.tree.command(name='crear_clan', description='Crear un nuevo clan')
-@discord.app_commands.describe(nombre_clan='Nombre del clan a crear')
-async def crear_clan(interaction: discord.Interaction, nombre_clan: str):
-    if not isinstance(interaction.channel, discord.Thread):
-        await interaction.response.send_message("❌ Este comando solo se puede usar dentro de un ticket.", ephemeral=True)
+    if clan_existe(nombre):
+        await interaction.response.send_message(
+            f"❌ El clan '{nombre}' ya existe.",
+            ephemeral=True
+        )
         return
-    
+
+    await interaction.response.defer(ephemeral=True)
+
     guild = interaction.guild
     autor = interaction.user
 
-    if clan_existe(nombre_clan):
-        await interaction.response.send_message(f"❌ El clan '{nombre_clan}' ya existe.", ephemeral=True)
-        return
-
-    await interaction.response.defer()
-    
     try:
         # Crear rol del clan
         clan_role = await guild.create_role(
-            name=f"Clan-{nombre_clan}",
+            name=f"Clan-{nombre}",
             mentionable=True,
             hoist=True
         )
-        
+
         # Crear categoría para el clan
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(read_messages=False),
             clan_role: discord.PermissionOverwrite(read_messages=True),
             guild.me: discord.PermissionOverwrite(read_messages=True)
         }
-        
+
         # Agregar permisos para administradores
         for role in guild.roles:
             if role.permissions.administrator:
                 overwrites[role] = discord.PermissionOverwrite(read_messages=True)
-        
+
         categoria = await guild.create_category(
-            f"🏰 {nombre_clan}",
+            f"🏰 {nombre}",
             overwrites=overwrites
         )
-        
-        # Canal de anuncios (solo admins pueden escribir)
+
+        # Canal de anuncios (solo admins pueden escribir, contiene invitación secreta)
         admin_overwrites = overwrites.copy()
         admin_overwrites[clan_role] = discord.PermissionOverwrite(
             read_messages=True,
             send_messages=False
         )
-        
+
         canal_anuncios = await categoria.create_text_channel(
             "📢-anuncios",
             overwrites=admin_overwrites
         )
-        
-        # Canal de administración del clan
+
+        # Canal de administración del clan (solo creador + admins servidor)
         admin_only_overwrites = {
             guild.default_role: discord.PermissionOverwrite(read_messages=False),
             autor: discord.PermissionOverwrite(read_messages=True, send_messages=True),
             guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
         }
-        
+
         for role in guild.roles:
             if role.permissions.administrator:
                 admin_only_overwrites[role] = discord.PermissionOverwrite(read_messages=True)
-        
+
         canal_admin = await categoria.create_text_channel(
             "⚙️-administracion",
             overwrites=admin_only_overwrites
         )
-        
+
         # Canal general del clan
         canal_general = await categoria.create_text_channel(
             "💬-general",
             overwrites=overwrites
         )
-        
-        # Crear invitación permanente
+
+        # Crear invitación permanente SECRETA
         invite = await canal_anuncios.create_invite(
             max_age=0,  # No expira
             max_uses=0,  # Usos ilimitados
             unique=True
         )
-        
+
         # Asignar rol al creador
         await autor.add_roles(clan_role)
 
-        # Guardar datos del clan en SQLite
+        # Guardar en base de datos
         crear_clan(
-            nombre=nombre_clan,
+            nombre=nombre,
             creador_id=autor.id,
+            descripcion=descripcion,
             rol_id=clan_role.id,
             categoria_id=categoria.id,
             canal_anuncios_id=canal_anuncios.id,
@@ -201,173 +246,530 @@ async def crear_clan(interaction: discord.Interaction, nombre_clan: str):
             canal_general_id=canal_general.id,
             invite_code=invite.code
         )
-        
-        # Enviar mensaje en el canal de anuncios
+
+        # Mensaje en anuncios (solo visible para admins y creador)
         embed_anuncios = discord.Embed(
-            title=f"🏰 Bienvenido al Clan {nombre_clan}",
-            description=f"¡Únete al clan usando este enlace!\n\n🔗 **Invitación:** {invite.url}\n\n*Esta invitación nunca expira*",
+            title=f"🏰 Bienvenido al Clan {nombre}",
+            description=f"**Invitación Permanente (SECRETA)**\n\n🔗 {invite.url}\n\n⚠️ Solo comparte este enlace con personas de confianza.\nPara invitar oficialmente, usa `/invitar_clan`",
             color=0x00ff00
         )
         await canal_anuncios.send(embed=embed_anuncios)
-        
-        # Enviar mensaje en el canal de administración
+
+        # Mensaje en administración
         embed_admin = discord.Embed(
             title="⚙️ Panel de Administración del Clan",
-            description=f"¡Hola {autor.mention}! Aquí puedes gestionar tu clan.\n\n**Comandos disponibles:**\n`/agregar_canal_texto <nombre>` - Agregar canal de texto\n`/agregar_canal_voz <nombre>` - Agregar canal de voz\n`/listar_canales` - Ver canales del clan\n`/eliminar_canal <nombre>` - Eliminar canal",
+            description=f"¡Hola {autor.mention}! Tu clan ha sido creado.\n\n**📊 Estado Inicial:**\n• Nivel: 1\n• XP: 0/500\n• Límite de miembros: 10\n• Canales texto extra: 0/3\n• Canales voz extra: 0/2\n\n**Comandos disponibles:**\n`/agregar_canal` - Agregar canal\n`/stats_clan` - Ver estadísticas\n`/invitar_clan` - Invitar miembro\n`/gestionar_miembros` - Ver/gestionar miembros\n`/ver_invitacion` - Ver invitación secreta",
             color=0x0099ff
         )
         await canal_admin.send(embed=embed_admin)
-        
-        await interaction.followup.send(f"✅ ¡Clan '{nombre_clan}' creado exitosamente!\n\n📂 Categoría: {categoria.mention}\n🎭 Rol: {clan_role.mention}\n🔗 Invitación: {invite.url}")
-        
+
+        # Respuesta al usuario
+        await interaction.followup.send(
+            f"✅ ¡Clan **{nombre}** creado exitosamente!\n\n"
+            f"📂 Categoría: {categoria.mention}\n"
+            f"🎭 Rol: {clan_role.mention}\n"
+            f"📊 Nivel: 1 (0/500 XP)\n"
+            f"👥 Límite de miembros: 10\n\n"
+            f"🔐 La invitación secreta está en {canal_anuncios.mention}",
+            ephemeral=True
+        )
+
     except Exception as e:
-        await interaction.followup.send(f"❌ Error al crear el clan: {str(e)}")
+        logger.error(f"Error al crear clan: {e}")
+        await interaction.followup.send(
+            f"❌ Error al crear el clan: {str(e)}",
+            ephemeral=True
+        )
 
-@bot.tree.command(name='agregar_canal_texto', description='Agregar un canal de texto al clan')
-@discord.app_commands.describe(nombre_canal='Nombre del canal de texto a crear')
-async def agregar_canal_texto(interaction: discord.Interaction, nombre_canal: str):
-    await agregar_canal(interaction, nombre_canal, 'texto')
+@bot.tree.command(name='listar_clanes', description='Ver todos los clanes disponibles en el servidor')
+async def listar_clanes(interaction: discord.Interaction):
+    """Listar todos los clanes con información básica"""
 
-@bot.tree.command(name='agregar_canal_voz', description='Agregar un canal de voz al clan')
-@discord.app_commands.describe(nombre_canal='Nombre del canal de voz a crear')
-async def agregar_canal_voz(interaction: discord.Interaction, nombre_canal: str):
-    await agregar_canal(interaction, nombre_canal, 'voz')
+    clanes = obtener_todos_clanes()
 
-async def agregar_canal(interaction, nombre_canal, tipo_canal):
-    if not isinstance(interaction.channel, discord.TextChannel):
-        await interaction.response.send_message("❌ Este comando solo se puede usar en canales de texto.", ephemeral=True)
+    if not clanes:
+        embed = discord.Embed(
+            title="🏰 No hay clanes creados",
+            description="Usa `/crear_clan` para crear el primero.",
+            color=0xff9900
+        )
+        await interaction.response.send_message(embed=embed)
         return
-    
-    # Buscar el clan del canal actual
+
+    embed = discord.Embed(
+        title=f"🏰 Clanes en {interaction.guild.name}",
+        description=f"Total: {len(clanes)} clanes",
+        color=0x0099ff
+    )
+
+    for nombre, info in list(clanes.items())[:10]:  # Máximo 10 para no saturar
+        nivel_config = NIVELES_CLAN[info['nivel']]
+
+        creador = interaction.guild.get_member(info['creador'])
+        creador_str = creador.mention if creador else "Desconocido"
+
+        embed.add_field(
+            name=f"{'⭐' * info['nivel']} {nombre}",
+            value=f"**Líder:** {creador_str}\n"
+                  f"**Nivel:** {info['nivel']} ({info['xp_actual']} XP)\n"
+                  f"**Miembros:** {info['total_miembros']}/{nivel_config['limite_miembros']}\n"
+                  f"**Descripción:** {info['descripcion'] or 'Sin descripción'}",
+            inline=False
+        )
+
+    if len(clanes) > 10:
+        embed.set_footer(text=f"Mostrando 10 de {len(clanes)} clanes. Usa /info_clan para ver uno específico.")
+
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name='info_clan', description='Ver información detallada de un clan')
+@app_commands.describe(nombre='Nombre del clan')
+async def info_clan(interaction: discord.Interaction, nombre: str):
+    """Mostrar información detallada de un clan (SIN invitación)"""
+
+    if not clan_existe(nombre):
+        await interaction.response.send_message(
+            f"❌ El clan '{nombre}' no existe.",
+            ephemeral=True
+        )
+        return
+
+    clan_info = obtener_clan(nombre)
+    miembros = obtener_miembros_clan(nombre)
+    nivel_config = NIVELES_CLAN[clan_info['nivel']]
+
+    # Creador
+    creador = interaction.guild.get_member(clan_info['creador'])
+    creador_str = creador.mention if creador else "Desconocido"
+
+    # Rol del clan
+    clan_role = interaction.guild.get_role(clan_info['rol_id'])
+
+    embed = discord.Embed(
+        title=f"🏰 {nombre}",
+        description=clan_info['descripcion'] or "Sin descripción",
+        color=clan_role.color if clan_role else 0x0099ff
+    )
+
+    # Información básica
+    embed.add_field(
+        name="👑 Líder",
+        value=creador_str,
+        inline=True
+    )
+
+    embed.add_field(
+        name="📊 Nivel",
+        value=f"{'⭐' * clan_info['nivel']} Nivel {clan_info['nivel']}",
+        inline=True
+    )
+
+    embed.add_field(
+        name="💎 XP",
+        value=f"{clan_info['xp_actual']}/{clan_info['xp_siguiente_nivel'] if clan_info['nivel'] < 6 else 'MAX'}",
+        inline=True
+    )
+
+    # Miembros
+    lideres = [m for m in miembros if m['rol'] == 'Líder']
+    colideres = [m for m in miembros if m['rol'] == 'Co-Líder']
+
+    miembros_str = f"**Total:** {clan_info['total_miembros']}/{nivel_config['limite_miembros']}\n"
+    if lideres:
+        miembros_str += f"👑 {len(lideres)} Líder(es)\n"
+    if colideres:
+        miembros_str += f"⚔️ {len(colideres)} Co-Líder(es)\n"
+
+    embed.add_field(
+        name="👥 Miembros",
+        value=miembros_str,
+        inline=False
+    )
+
+    # Canales
+    canales_texto_usados = contar_canales_extra(nombre, 'texto')
+    canales_voz_usados = contar_canales_extra(nombre, 'voz')
+
+    embed.add_field(
+        name="📁 Canales",
+        value=f"💬 Texto: {canales_texto_usados}/{nivel_config['canales_texto']}\n"
+              f"🔊 Voz: {canales_voz_usados}/{nivel_config['canales_voz']}",
+        inline=True
+    )
+
+    # Fecha de creación
+    fecha = datetime.fromisoformat(clan_info['fecha_creacion'])
+    embed.set_footer(text=f"Creado el {fecha.strftime('%d/%m/%Y')}")
+
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name='invitar_clan', description='Invitar a alguien a tu clan')
+@app_commands.describe(
+    usuario='Usuario a invitar',
+    clan='Nombre del clan',
+    rol='Rol que tendrá en el clan'
+)
+@app_commands.choices(rol=[
+    app_commands.Choice(name='Recluta', value='Recluta'),
+    app_commands.Choice(name='Miembro', value='Miembro'),
+])
+async def invitar_clan(interaction: discord.Interaction, usuario: discord.Member, clan: str, rol: app_commands.Choice[str]):
+    """Invitar a un usuario al clan mediante DM"""
+
+    # Validaciones
+    if not clan_existe(clan):
+        await interaction.response.send_message(
+            f"❌ El clan '{clan}' no existe.",
+            ephemeral=True
+        )
+        return
+
+    # Verificar que quien invita es Líder o Co-Líder
+    rol_invitador = obtener_rol_miembro(clan, interaction.user.id)
+    if rol_invitador not in ['Líder', 'Co-Líder']:
+        await interaction.response.send_message(
+            "❌ Solo Líderes y Co-Líderes pueden invitar miembros.",
+            ephemeral=True
+        )
+        return
+
+    # Verificar que el usuario no esté en el clan
+    if es_miembro_clan(clan, usuario.id):
+        await interaction.response.send_message(
+            f"❌ {usuario.mention} ya es miembro del clan.",
+            ephemeral=True
+        )
+        return
+
+    # Verificar límite de miembros
+    clan_info = obtener_clan(clan)
+    if clan_info['total_miembros'] >= clan_info['limite_miembros']:
+        await interaction.response.send_message(
+            f"❌ El clan ha alcanzado su límite de {clan_info['limite_miembros']} miembros.\n"
+            f"Sube de nivel el clan para aumentar el límite.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    # Crear invitación en DB
+    invitacion_id = crear_invitacion(
+        clan_nombre=clan,
+        usuario_invitado_id=usuario.id,
+        usuario_que_invita_id=interaction.user.id,
+        rol_asignado=rol.value,
+        horas_expiracion=48
+    )
+
+    if not invitacion_id:
+        await interaction.followup.send(
+            "❌ Error al crear la invitación.",
+            ephemeral=True
+        )
+        return
+
+    # Enviar DM al usuario
+    try:
+        embed = discord.Embed(
+            title="🏰 Invitación a Clan",
+            description=f"{interaction.user.mention} te ha invitado a unirte al clan **{clan}**",
+            color=0x00ff00
+        )
+
+        embed.add_field(
+            name="📋 Información del Clan",
+            value=f"**Nivel:** {clan_info['nivel']} ({'⭐' * clan_info['nivel']})\n"
+                  f"**Miembros:** {clan_info['total_miembros']}/{clan_info['limite_miembros']}\n"
+                  f"**Descripción:** {clan_info['descripcion'] or 'Sin descripción'}",
+            inline=False
+        )
+
+        embed.add_field(
+            name="🎭 Rol que recibirás",
+            value=rol.value,
+            inline=True
+        )
+
+        embed.add_field(
+            name="⏰ Expiración",
+            value="48 horas",
+            inline=True
+        )
+
+        view = InvitacionView(invitacion_id)
+        await usuario.send(embed=embed, view=view)
+
+        await interaction.followup.send(
+            f"✅ Invitación enviada a {usuario.mention}",
+            ephemeral=True
+        )
+
+    except discord.Forbidden:
+        await interaction.followup.send(
+            f"❌ No pude enviar DM a {usuario.mention}. Sus DMs están cerrados.",
+            ephemeral=True
+        )
+
+# ==================== COMANDOS DE ADMINISTRACIÓN DEL CLAN ====================
+
+@bot.tree.command(name='agregar_canal', description='Agregar un canal al clan')
+@app_commands.describe(
+    tipo='Tipo de canal',
+    nombre='Nombre del canal'
+)
+@app_commands.choices(tipo=[
+    app_commands.Choice(name='💬 Texto', value='texto'),
+    app_commands.Choice(name='🔊 Voz', value='voz'),
+])
+async def agregar_canal(interaction: discord.Interaction, tipo: app_commands.Choice[str], nombre: str):
+    """Agregar un canal de texto o voz al clan"""
+
+    # Verificar que se use en un canal de administración
     clan_nombre = obtener_clan_por_canal_admin(interaction.channel.id)
 
     if not clan_nombre:
-        await interaction.response.send_message("❌ Este no es un canal de administración de clan válido.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ Este comando solo se puede usar en el canal de administración del clan.",
+            ephemeral=True
+        )
         return
 
-    clan_data = obtener_clan(clan_nombre)
-
     # Verificar permisos
-    if interaction.user.id != clan_data['creador'] and not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Solo el creador del clan o administradores pueden usar este comando.", ephemeral=True)
+    rol_usuario = obtener_rol_miembro(clan_nombre, interaction.user.id)
+    if rol_usuario not in ['Líder', 'Co-Líder'] and not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "❌ Solo Líderes, Co-Líderes o Administradores pueden agregar canales.",
+            ephemeral=True
+        )
+        return
+
+    # Verificar límite de canales según nivel
+    clan_info = obtener_clan(clan_nombre)
+    canales_usados = contar_canales_extra(clan_nombre, tipo.value)
+
+    limite = clan_info[f'limite_canales_{tipo.value}']
+
+    if canales_usados >= limite:
+        await interaction.response.send_message(
+            f"❌ Has alcanzado el límite de canales de {tipo.name}: {canales_usados}/{limite}\n"
+            f"Sube de nivel el clan para desbloquear más canales.",
+            ephemeral=True
+        )
         return
 
     await interaction.response.defer()
 
     try:
         guild = interaction.guild
-        categoria_id = clan_data['categoria_id']
+        categoria_id = clan_info['categoria_id']
         categoria = guild.get_channel(categoria_id)
-        clan_role = guild.get_role(clan_data['rol_id'])
-        
+        clan_role = guild.get_role(clan_info['rol_id'])
+
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(read_messages=False),
             clan_role: discord.PermissionOverwrite(read_messages=True),
             guild.me: discord.PermissionOverwrite(read_messages=True)
         }
-        
+
         for role in guild.roles:
             if role.permissions.administrator:
                 overwrites[role] = discord.PermissionOverwrite(read_messages=True)
-        
-        if tipo_canal == 'texto':
+
+        if tipo.value == 'texto':
             nuevo_canal = await categoria.create_text_channel(
-                nombre_canal,
+                nombre,
                 overwrites=overwrites
             )
         else:  # voz
             nuevo_canal = await categoria.create_voice_channel(
-                nombre_canal,
+                nombre,
                 overwrites=overwrites
             )
-        
-        # Guardar canal extra en SQLite
-        agregar_canal_extra(clan_nombre, nuevo_canal.id, nombre_canal, tipo_canal)
-        
-        await interaction.followup.send(f"✅ Canal {tipo_canal} '{nombre_canal}' creado exitosamente: {nuevo_canal.mention}")
-        
-    except Exception as e:
-        await interaction.followup.send(f"❌ Error al crear el canal: {str(e)}")
 
-@bot.tree.command(name='listar_canales', description='Ver todos los canales del clan')
-async def listar_canales(interaction: discord.Interaction):
+        # Guardar en DB
+        agregar_canal_extra(clan_nombre, nuevo_canal.id, nombre, tipo.value)
+
+        await interaction.followup.send(
+            f"✅ Canal {tipo.name} **{nombre}** creado: {nuevo_canal.mention if tipo.value == 'texto' else nuevo_canal.name}\n"
+            f"Canales {tipo.name}: {canales_usados + 1}/{limite}"
+        )
+
+    except Exception as e:
+        logger.error(f"Error al crear canal: {e}")
+        await interaction.followup.send(
+            f"❌ Error al crear el canal: {str(e)}"
+        )
+
+@bot.tree.command(name='stats_clan', description='Ver estadísticas del clan')
+async def stats_clan(interaction: discord.Interaction):
+    """Ver estadísticas y progreso del clan"""
+
+    # Verificar que se use en un canal del clan
     clan_nombre = obtener_clan_por_canal_admin(interaction.channel.id)
 
     if not clan_nombre:
-        await interaction.response.send_message("❌ Este no es un canal de administración de clan válido.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ Este comando solo se puede usar en canales del clan.",
+            ephemeral=True
+        )
         return
 
-    data = obtener_clan(clan_nombre)
-    guild = interaction.guild
-    
+    clan_info = obtener_clan(clan_nombre)
+    nivel_config = NIVELES_CLAN[clan_info['nivel']]
+
     embed = discord.Embed(
-        title=f"📋 Canales del Clan {clan_nombre}",
+        title=f"📊 Estadísticas de {clan_nombre}",
         color=0x0099ff
     )
-    
-    canales_base = [
-        f"📢 <#{data['canal_anuncios_id']}>",
-        f"⚙️ <#{data['canal_admin_id']}>",
-        f"💬 <#{data['canal_general_id']}>"
-    ]
-    
-    embed.add_field(
-        name="Canales Base",
-        value="\n".join(canales_base),
-        inline=False
-    )
-    
-    if data['canales_extra']:
-        canales_extra = []
-        for canal in data['canales_extra']:
-            emoji = "💬" if canal['tipo'] == 'texto' else "🔊"
-            canales_extra.append(f"{emoji} <#{canal['id']}>")
-        
+
+    # Nivel y XP
+    if clan_info['nivel'] < 6:
+        xp_para_siguiente = clan_info['xp_siguiente_nivel'] - clan_info['xp_actual']
+        progreso = (clan_info['xp_actual'] / clan_info['xp_siguiente_nivel']) * 100
+
         embed.add_field(
-            name="Canales Adicionales",
-            value="\n".join(canales_extra),
+            name="💎 Experiencia",
+            value=f"**Nivel:** {clan_info['nivel']} {'⭐' * clan_info['nivel']}\n"
+                  f"**XP:** {clan_info['xp_actual']}/{clan_info['xp_siguiente_nivel']}\n"
+                  f"**Progreso:** {progreso:.1f}%\n"
+                  f"**Faltan:** {xp_para_siguiente} XP para nivel {clan_info['nivel'] + 1}",
             inline=False
         )
-    
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name='info_clan', description='Ver información de un clan o lista de clanes')
-@discord.app_commands.describe(nombre_clan='Nombre del clan (opcional)')
-async def info_clan(interaction: discord.Interaction, nombre_clan: str = None):
-    if nombre_clan and clan_existe(nombre_clan):
-        data = obtener_clan(nombre_clan)
-        guild = interaction.guild
-
-        creador = guild.get_member(data['creador'])
-        clan_role = guild.get_role(data['rol_id'])
-
-        embed = discord.Embed(
-            title=f"🏰 Información del Clan {nombre_clan}",
-            color=0x0099ff
+    else:
+        embed.add_field(
+            name="💎 Experiencia",
+            value=f"**Nivel:** 6 ⭐⭐⭐⭐⭐⭐ (MÁXIMO)\n"
+                  f"**XP:** {clan_info['xp_actual']}",
+            inline=False
         )
 
-        embed.add_field(name="👑 Creador", value=creador.mention if creador else "Desconocido", inline=True)
-        embed.add_field(name="👥 Miembros", value=len(clan_role.members) if clan_role else "0", inline=True)
-        embed.add_field(name="🔗 Invitación", value=f"https://discord.gg/{data['invite_code']}", inline=False)
+    # Miembros
+    embed.add_field(
+        name="👥 Miembros",
+        value=f"{clan_info['total_miembros']}/{nivel_config['limite_miembros']}",
+        inline=True
+    )
 
-        await interaction.response.send_message(embed=embed)
-    else:
-        todos_los_clanes = obtener_todos_clanes()
-        clanes_disponibles = list(todos_los_clanes.keys())
-        if clanes_disponibles:
-            embed = discord.Embed(
-                title="🏰 Clanes Disponibles",
-                description="\n".join([f"• {clan}" for clan in clanes_disponibles]),
-                color=0x0099ff
+    # Canales
+    canales_texto = contar_canales_extra(clan_nombre, 'texto')
+    canales_voz = contar_canales_extra(clan_nombre, 'voz')
+
+    embed.add_field(
+        name="📁 Canales",
+        value=f"💬 Texto: {canales_texto}/{nivel_config['canales_texto']}\n"
+              f"🔊 Voz: {canales_voz}/{nivel_config['canales_voz']}",
+        inline=True
+    )
+
+    # Siguiente nivel
+    if clan_info['nivel'] < 6:
+        siguiente_nivel = NIVELES_CLAN[clan_info['nivel'] + 1]
+        embed.add_field(
+            name=f"🎯 Al alcanzar Nivel {clan_info['nivel'] + 1}",
+            value=f"👥 Miembros: {siguiente_nivel['limite_miembros']}\n"
+                  f"💬 Canales texto: {siguiente_nivel['canales_texto']}\n"
+                  f"🔊 Canales voz: {siguiente_nivel['canales_voz']}",
+            inline=False
+        )
+
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name='gestionar_miembros', description='Ver y gestionar miembros del clan')
+async def gestionar_miembros(interaction: discord.Interaction):
+    """Ver lista de miembros del clan con sus roles"""
+
+    # Verificar que se use en canal de admin
+    clan_nombre = obtener_clan_por_canal_admin(interaction.channel.id)
+
+    if not clan_nombre:
+        await interaction.response.send_message(
+            "❌ Este comando solo se puede usar en el canal de administración.",
+            ephemeral=True
+        )
+        return
+
+    # Verificar permisos
+    rol_usuario = obtener_rol_miembro(clan_nombre, interaction.user.id)
+    if rol_usuario not in ['Líder', 'Co-Líder'] and not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "❌ Solo Líderes y Co-Líderes pueden gestionar miembros.",
+            ephemeral=True
+        )
+        return
+
+    miembros = obtener_miembros_clan(clan_nombre)
+
+    if not miembros:
+        await interaction.response.send_message(
+            "❌ No hay miembros en este clan.",
+            ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title=f"👥 Miembros de {clan_nombre}",
+        description=f"Total: {len(miembros)} miembros",
+        color=0x0099ff
+    )
+
+    # Agrupar por rol
+    roles = {'Líder': [], 'Co-Líder': [], 'Miembro': [], 'Recluta': []}
+
+    for miembro in miembros:
+        usuario = interaction.guild.get_member(miembro['usuario_id'])
+        if usuario:
+            roles[miembro['rol']].append(usuario.mention)
+
+    for rol, usuarios in roles.items():
+        if usuarios:
+            emoji = {'Líder': '👑', 'Co-Líder': '⚔️', 'Miembro': '🛡️', 'Recluta': '🗡️'}[rol]
+            embed.add_field(
+                name=f"{emoji} {rol} ({len(usuarios)})",
+                value='\n'.join(usuarios) or 'Ninguno',
+                inline=False
             )
-        else:
-            embed = discord.Embed(
-                title="🏰 No hay clanes creados",
-                description="Usa `/crear_clan <nombre>` para crear el primero.",
-                color=0xff9900
-            )
-        
-        await interaction.response.send_message(embed=embed)
+
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name='ver_invitacion', description='Ver la invitación secreta del clan')
+async def ver_invitacion(interaction: discord.Interaction):
+    """Mostrar la invitación permanente del clan (solo para Líder y admins)"""
+
+    # Verificar que se use en canal de admin
+    clan_nombre = obtener_clan_por_canal_admin(interaction.channel.id)
+
+    if not clan_nombre:
+        await interaction.response.send_message(
+            "❌ Este comando solo se puede usar en el canal de administración.",
+            ephemeral=True
+        )
+        return
+
+    # Verificar permisos (solo Líder o Admin servidor)
+    rol_usuario = obtener_rol_miembro(clan_nombre, interaction.user.id)
+    if rol_usuario != 'Líder' and not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "❌ Solo el Líder del clan o Administradores del servidor pueden ver la invitación.",
+            ephemeral=True
+        )
+        return
+
+    clan_info = obtener_clan(clan_nombre)
+
+    embed = discord.Embed(
+        title="🔐 Invitación Secreta del Clan",
+        description=f"**Enlace permanente:**\nhttps://discord.gg/{clan_info['invite_code']}\n\n"
+                    f"⚠️ **IMPORTANTE:**\n"
+                    f"• Esta invitación nunca expira\n"
+                    f"• Compártela solo con personas de confianza\n"
+                    f"• Para invitaciones oficiales, usa `/invitar_clan`",
+        color=0xff9900
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# ==================== EJECUTAR BOT ====================
 
 if __name__ == '__main__':
     bot.run(os.getenv('DISCORD_TOKEN'))
