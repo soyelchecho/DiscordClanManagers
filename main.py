@@ -214,7 +214,7 @@ class InvitacionView(discord.ui.View):
 
 class ConfirmacionClanView(discord.ui.View):
     def __init__(self, autor_id: int, thread: discord.Thread):
-        super().__init__(timeout=120)  # 2 minutos de timeout
+        super().__init__(timeout=300)  # 5 minutos de timeout
         self.autor_id = autor_id
         self.thread = thread
         self.confirmado = None
