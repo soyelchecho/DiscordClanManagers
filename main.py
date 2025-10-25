@@ -34,10 +34,19 @@ async def on_ready():
     migrate_from_json()
 
     try:
-        synced = await bot.tree.sync()
-        print(f'Sincronizados {len(synced)} comandos de barra')
+        # Sincronizar comandos directamente en el servidor (más rápido)
+        guild_id = os.getenv('GUILD_ID')
+        if guild_id:
+            guild_id = int(guild_id)
+            guild = discord.Object(id=guild_id)
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            print(f'✅ Sincronizados {len(synced)} comandos en servidor {guild_id}')
+        else:
+            synced = await bot.tree.sync()
+            print(f'✅ Sincronizados {len(synced)} comandos globalmente')
     except Exception as e:
-        print(f'Error al sincronizar comandos: {e}')
+        print(f'❌ Error al sincronizar comandos: {e}')
 
 class TicketView(discord.ui.View):
     def __init__(self):
